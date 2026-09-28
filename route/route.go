@@ -166,6 +166,7 @@ func (r *Router) routeConnection(ctx context.Context, conn net.Conn, metadata ad
 	if selectedRule != nil {
 		metadata.RouteRule = selectedRule.String()
 	}
+	dropMatchAddresses(&metadata, selectedOutbound)
 	metadata.RouteOutbound = selectedOutbound.Tag()
 	for _, tracker := range r.trackers {
 		conn = tracker.RoutedConnection(ctx, conn, metadata, selectedRule, selectedOutbound)
@@ -298,6 +299,7 @@ func (r *Router) routePacketConnection(ctx context.Context, conn N.PacketConn, m
 	if selectedRule != nil {
 		metadata.RouteRule = selectedRule.String()
 	}
+	dropMatchAddresses(&metadata, selectedOutbound)
 	metadata.RouteOutbound = selectedOutbound.Tag()
 	for _, tracker := range r.trackers {
 		conn = tracker.RoutedPacketConnection(ctx, conn, metadata, selectedRule, selectedOutbound)
@@ -680,9 +682,10 @@ match:
 				return
 			}
 		case *R.RuleActionResolve:
-			fatalErr = r.actionResolve(ctx, metadata, action)
-			if fatalErr != nil {
-				return
+			// fork: a resolve step that only feeds IP rules must not kill a connection a
+			// proxy could still carry by name; matching goes on as if it never ran
+			if err := r.actionResolve(ctx, metadata, action); err != nil {
+				r.logger.DebugContext(ctx, "resolve failed, matching without addresses: ", err)
 			}
 		}
 		actionType := currentRule.Action().Type()
@@ -893,6 +896,16 @@ func (r *Router) actionSniff(
 		}
 	}
 	return
+}
+
+// dropMatchAddresses (fork): addresses a resolve action found for a domain destination serve
+// rule matching; anything but direct gets the name back, so the exit resolves it for its own
+// location. With the addresses kept, every proxied connection went to the edge the NAS's
+// Russian DNS picked, geo-DNS CDNs (Akamai, CloudFront) included.
+func dropMatchAddresses(metadata *adapter.InboundContext, outbound adapter.Outbound) {
+	if metadata.Destination.IsFqdn() && outbound.Type() != C.TypeDirect {
+		metadata.DestinationAddresses = nil
+	}
 }
 
 func (r *Router) actionResolve(ctx context.Context, metadata *adapter.InboundContext, action *R.RuleActionResolve) error {

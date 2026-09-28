@@ -48,6 +48,8 @@ type URLTest struct {
 	group                        *URLTestGroup
 	checkAccess                  sync.Mutex
 	interruptExternalConnections bool
+	options                      option.URLTestOutboundOptions
+	smart                        *smartGroup
 }
 
 func NewURLTest(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.URLTestOutboundOptions) (adapter.Outbound, error) {
@@ -63,6 +65,7 @@ func NewURLTest(ctx context.Context, router adapter.Router, logger log.ContextLo
 		tolerance:                    options.Tolerance,
 		idleTimeout:                  time.Duration(options.IdleTimeout),
 		interruptExternalConnections: options.InterruptExistConnections,
+		options:                      options,
 	}
 	if len(outbound.tags) == 0 {
 		return nil, E.New("missing tags")
@@ -84,21 +87,42 @@ func (s *URLTest) Start() error {
 		return err
 	}
 	s.group = group
+	s.smart = newSmartGroup(s.ctx, s.logger, s.Tag(), group.history, s.outbound, s.tags, smartOptions{
+		link:        s.link,
+		interval:    s.interval,
+		tolerance:   s.tolerance,
+		idle:        s.idleTimeout,
+		fast:        time.Duration(s.options.FastInterval),
+		expected:    s.options.ExpectedStatus,
+		disableRace: s.options.DisableRace,
+		exclude:     s.options.ExcludeEgress,
+		egressURL:   s.options.EgressURL,
+		minSpeed:    s.options.MinSpeed,
+		speedURL:    s.options.SpeedURL,
+		mode:        s.options.Mode,
+		siteTTL:     time.Duration(s.options.SiteMemory),
+		hedge:       time.Duration(s.options.HedgeDelay),
+		lastResort:  s.options.LastResort,
+	})
 	return nil
 }
 
 func (s *URLTest) PostStart() error {
-	s.group.PostStart()
+	s.smart.start()
 	return nil
 }
 
 func (s *URLTest) Close() error {
 	return common.Close(
+		common.PtrOrNil(s.smart),
 		common.PtrOrNil(s.group),
 	)
 }
 
 func (s *URLTest) Now() string {
+	if s.smart != nil {
+		return s.smart.Now()
+	}
 	if s.group.selectedOutboundTCP != nil {
 		return s.group.selectedOutboundTCP.Tag()
 	} else if s.group.selectedOutboundUDP != nil {
@@ -112,23 +136,19 @@ func (s *URLTest) All() []string {
 }
 
 func (s *URLTest) URLTest(ctx context.Context) (map[string]uint16, error) {
-	return s.group.URLTest(ctx)
+	return s.smart.testAll(), nil
 }
 
 func (s *URLTest) CheckOutbounds() {
-	s.group.CheckOutbounds(s.ctx, true)
+	s.smart.probeAll()
 }
 
 func (s *URLTest) PerformUpdateCheck() {
-	s.group.performUpdateCheck()
+	s.smart.reselect()
 }
 
 func (s *URLTest) InterfaceUpdated(ctx context.Context) {
-	group := s.group
-	if group == nil {
-		return
-	}
-	if group.pause.IsDevicePaused() || group.pause.IsNetworkPaused() {
+	if s.group == nil || s.group.pause.IsDevicePaused() || s.group.pause.IsNetworkPaused() {
 		return
 	}
 	go func() {
@@ -137,62 +157,36 @@ func (s *URLTest) InterfaceUpdated(ctx context.Context) {
 		if ctx.Err() != nil {
 			return
 		}
-		group.CheckOutbounds(ctx, true)
+		s.smart.probeAll()
 	}()
 }
 
 func (s *URLTest) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
-	s.group.Touch()
-	var outbound adapter.Outbound
 	switch N.NetworkName(network) {
 	case N.NetworkTCP:
-		outbound = s.group.selectedOutboundTCP
+		// Used when this group is a member of another group (lb-cheburnet inside
+		// auto-direct) or dialed by the probe: race the nodes here too, so one hung node
+		// cannot hold the caller for a full dial timeout.
+		s.smart.touch()
+		return s.smart.dialRace(ctx, adapter.InboundContext{Destination: destination}, nil, !s.options.DisableRace, false)
 	case N.NetworkUDP:
-		outbound = s.group.selectedOutboundUDP
 	default:
 		return nil, E.Extend(N.ErrUnknownNetwork, network)
 	}
-	if outbound == nil {
-		outbound, _ = s.group.Select(network)
-	}
-	if outbound == nil {
-		return nil, E.New("missing supported outbound")
-	}
-	conn, err := outbound.DialContext(ctx, network, destination)
-	if err == nil {
-		return s.group.interruptGroup.NewConn(conn, interrupt.IsExternalConnectionFromContext(ctx)), nil
-	}
-	s.logger.ErrorContext(ctx, err)
-	s.group.history.DeleteURLTestHistory(outbound.Tag())
-	return nil, err
+	return s.smart.dialSerial(ctx, network, destination)
 }
 
 func (s *URLTest) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
-	s.group.Touch()
-	outbound := s.group.selectedOutboundUDP
-	if outbound == nil {
-		outbound, _ = s.group.Select(N.NetworkUDP)
-	}
-	if outbound == nil {
-		return nil, E.New("missing supported outbound")
-	}
-	conn, err := outbound.ListenPacket(ctx, destination)
-	if err == nil {
-		return s.group.interruptGroup.NewPacketConn(conn, interrupt.IsExternalConnectionFromContext(ctx)), nil
-	}
-	s.logger.ErrorContext(ctx, err)
-	s.group.history.DeleteURLTestHistory(outbound.Tag())
-	return nil, err
+	s.smart.touch()
+	return newMigratingPacketConn(ctx, s.smart, destination)
 }
 
 func (s *URLTest) NewConnection(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
-	ctx = interrupt.ContextWithIsExternalConnection(ctx)
-	s.connection.NewConnection(ctx, s, conn, metadata, onClose)
+	s.smart.newConnection(ctx, s.connection, conn, metadata, onClose)
 }
 
 func (s *URLTest) NewPacketConnection(ctx context.Context, conn N.PacketConn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
-	ctx = interrupt.ContextWithIsExternalConnection(ctx)
-	s.connection.NewPacketConnection(ctx, s, conn, metadata, onClose)
+	s.smart.newPacketConnection(ctx, s.connection, conn, metadata, onClose)
 }
 
 type URLTestGroup struct {

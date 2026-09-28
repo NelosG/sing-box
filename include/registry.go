@@ -14,6 +14,7 @@ import (
 	"github.com/sagernet/sing-box/dns"
 	"github.com/sagernet/sing-box/dns/transport"
 	"github.com/sagernet/sing-box/dns/transport/fakeip"
+	"github.com/sagernet/sing-box/dns/transport/fallback"
 	"github.com/sagernet/sing-box/dns/transport/hosts"
 	"github.com/sagernet/sing-box/dns/transport/local"
 	"github.com/sagernet/sing-box/dns/transport/mdns"
@@ -126,6 +127,7 @@ func DNSTransportRegistry() *dns.TransportRegistry {
 	transport.RegisterTLS(registry)
 	transport.RegisterHTTPS(registry)
 	hosts.RegisterTransport(registry)
+	fallback.RegisterTransport(registry)
 	local.RegisterTransport(registry)
 	mdns.RegisterTransport(registry)
 	fakeip.RegisterTransport(registry)

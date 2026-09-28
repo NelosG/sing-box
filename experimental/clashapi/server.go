@@ -21,6 +21,7 @@ import (
 	"github.com/sagernet/sing-box/experimental/clashmode"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
+	"github.com/sagernet/sing-box/protocol/group"
 	"github.com/sagernet/sing/common"
 	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/common/json"
@@ -126,6 +127,9 @@ func NewServer(ctx context.Context, logFactory log.ObservableFactory, options op
 		r.Mount("/profile", profileRouter())
 		r.Mount("/cache", cacheRouter(ctx))
 		r.Mount("/dns", dnsRouter(s.dnsRouter))
+		r.Get("/smart/health", func(w http.ResponseWriter, r *http.Request) {
+			render.JSON(w, r, group.Snapshot(s.urlTestHistory))
+		})
 
 		s.setupMetaAPI(r)
 	})
